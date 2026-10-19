@@ -9,8 +9,8 @@ use soroban_sdk::{
 fn positive_times_preserve_amount_across_boundaries() {
     let env = Env::default();
     env.mock_all_auths();
-    let contract_id = env.register(MilestoneEscrow, ());
-    let client = MilestoneEscrowClient::new(&env, &contract_id);
+    let amounts = vec![&env, 101_i128];
+    let (_, _, _, _, _, _contract_id, client) = setup_funded_escrow(&env, amounts);
 
     for (elapsed, total, expected_freelancer) in [
         (0_i128, 10_i128, 0_i128),
@@ -28,8 +28,8 @@ fn positive_times_preserve_amount_across_boundaries() {
 fn invalid_amount_and_time_inputs_return_specific_errors() {
     let env = Env::default();
     env.mock_all_auths();
-    let contract_id = env.register(MilestoneEscrow, ());
-    let client = MilestoneEscrowClient::new(&env, &contract_id);
+    let amounts = vec![&env, 1_i128];
+    let (_, _, _, _, _, _contract_id, client) = setup_funded_escrow(&env, amounts);
 
     for amount in [0_i128, -1_i128] {
         assert_eq!(
@@ -49,8 +49,8 @@ fn invalid_amount_and_time_inputs_return_specific_errors() {
 fn arithmetic_overflow_is_reported_without_panicking() {
     let env = Env::default();
     env.mock_all_auths();
-    let contract_id = env.register(MilestoneEscrow, ());
-    let client = MilestoneEscrowClient::new(&env, &contract_id);
+    let amounts = vec![&env, i128::MAX];
+    let (_, _, _, _, _, _contract_id, client) = setup_funded_escrow(&env, amounts);
 
     assert_eq!(
         client.try_milestone_time_extensions(&i128::MAX, &i128::MAX, &i128::MAX),
@@ -59,11 +59,69 @@ fn arithmetic_overflow_is_reported_without_panicking() {
 }
 
 #[test]
+fn test_milestone_time_extensions_rejects_invalid_source_state_without_acquiring_lock() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let amounts = vec![&env, 1_000_i128];
+    let (_, _, _, _, _, contract_id, client) = setup_funded_escrow(&env, amounts);
+
+    // An invalid amount must be rejected with a typed error and must not
+    // acquire the execution lock, leaving no on-chain state mutated.
+    assert_eq!(
+        client.try_milestone_time_extensions(&0, &1, &2),
+        Err(Ok(Error::InvalidAmount))
+    );
+
+    let lock_held = env.as_contract(&contract_id, || {
+        env.storage()
+            .instance()
+            .get::<_, bool>(&DataKey::TimeExtExecutionLock)
+            .unwrap_or(false)
+    });
+    assert!(
+        !lock_held,
+        "execution lock must not be acquired on invalid source state"
+    );
+}
+
+#[test]
+fn test_milestone_time_extensions_rejects_unauthorized_single_signature() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let amounts = vec![&env, 1_000_i128];
+    let (client_addr, _, _, _, _, contract_id, client) = setup_funded_escrow(&env, amounts);
+
+    // Only the client signs. The dual-consent guard in
+    // `milestone_time_extensions` (via `require_client_and_freelancer_consent`)
+    // triggers when the freelancer's signature is missing, so a single-signed
+    // invocation must never reach the split arithmetic and must not mutate any
+    // on-chain state.
+    let invoke = MockAuthInvoke {
+        contract: &contract_id,
+        fn_name: "time_extensions_consent",
+        args: (&1_000_i128, &1_i128, &2_i128).into_val(&env),
+        sub_invokes: &[],
+    };
+
+    let result = client
+        .mock_auths(&[MockAuth {
+            address: &client_addr,
+            invoke: &invoke,
+        }])
+        .try_milestone_time_extensions(&1_000, &1, &2);
+
+    assert!(
+        matches!(result, Err(Err(_))),
+        "single-signature attempt must revert"
+    );
+}
+
+#[test]
 fn successful_split_emits_complete_event_payload() {
     let env = Env::default();
     env.mock_all_auths();
-    let contract_id = env.register(MilestoneEscrow, ());
-    let client = MilestoneEscrowClient::new(&env, &contract_id);
+    let amounts = vec![&env, 101_i128];
+    let (_, _, _, _, _, _contract_id, client) = setup_funded_escrow(&env, amounts);
 
     let split = client.milestone_time_extensions(&101, &1, &2);
     let all_events = crate::all_event_tuples(&env);
@@ -95,6 +153,23 @@ fn deadline_extensions_accumulate_and_emit_new_total() {
     escrow.extend_milestone_deadline(&client_addr, &0, &250);
 
     assert_eq!(escrow.time_until_auto_release(&0), initial + 350);
+
+    let job = escrow.get_job();
+    let milestone = job.milestones.get(0).unwrap();
+    let events = crate::all_event_tuples(&env);
+    let event = DeadlineExtendedEvent::from_val(&env, &events.last().unwrap().2);
+    let expected_deadline = milestone.delivered_at + job.auto_release_seconds + 350;
+    assert_eq!(event.new_extension, 350);
+    assert_eq!(event.new_deadline, expected_deadline);
+
+    env.ledger().with_mut(|ledger| ledger.timestamp = event.new_deadline - 1);
+    assert_eq!(
+        escrow.try_claim_auto_release(&freelancer_addr, &0),
+        Err(Ok(Error::DeadlineNotPassed))
+    );
+    env.ledger()
+        .with_mut(|ledger| ledger.timestamp = event.new_deadline);
+    escrow.claim_auto_release(&freelancer_addr, &0);
 }
 
 #[test]
@@ -251,8 +326,8 @@ fn test_milestone_time_extensions_lock_blocks_extend_deadline() {
 fn test_milestone_time_extensions_releases_lock_after_success() {
     let env = Env::default();
     env.mock_all_auths();
-    let contract_id = env.register(MilestoneEscrow, ());
-    let client = MilestoneEscrowClient::new(&env, &contract_id);
+    let amounts = vec![&env, 1_000_i128];
+    let (_, _, _, _, _, contract_id, client) = setup_funded_escrow(&env, amounts);
 
     let _ = client.milestone_time_extensions(&1_000, &1, &2);
 
@@ -408,4 +483,302 @@ fn test_time_extensions_consent_matches_unauthenticated_calculator() {
     let gated = escrow.time_extensions_consent(&1_000, &3, &7);
     assert_eq!(calc.first, gated.first);
     assert_eq!(calc.second, gated.second);
+}
+
+// ── #581: checked arithmetic in time_until_auto_release ──────────────────────
+
+/// `delivered_at + auto_release_seconds` overflows u64: the first checked_add
+/// inside `time_until_auto_release` must return `InvalidAmount` rather than
+/// wrapping or panicking.
+#[test]
+fn time_until_auto_release_deadline_overflow_returns_invalid_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let amounts = vec![&env, 5_000_i128];
+    let (_, freelancer_addr, _, _, _, _, escrow) = setup_funded_escrow(&env, amounts);
+
+    // Place the ledger at u64::MAX so delivered_at = u64::MAX; any positive
+    // auto_release_seconds will overflow the first checked_add.
+    env.ledger().with_mut(|li| {
+        li.timestamp = u64::MAX;
+    });
+    escrow.mark_delivered(&freelancer_addr, &0);
+
+    assert_eq!(
+        escrow.try_time_until_auto_release(&0),
+        Err(Ok(Error::InvalidAmount))
+    );
+}
+
+/// `deadline - current` overflows i64: when `deadline as i64` wraps to
+/// `i64::MIN` the checked_sub must return `InvalidAmount` rather than wrapping.
+///
+/// `deadline as i64 == i64::MIN` when `deadline == 2^63`.  We arrange that by
+/// setting `delivered_at = 2^63 - auto_release_seconds` so that
+/// `delivered_at + auto_release_seconds = 2^63 exactly`, then set current = 1
+/// so `i64::MIN.checked_sub(1)` overflows.
+#[test]
+fn time_until_auto_release_subtraction_overflow_returns_invalid_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    // setup_funded_escrow uses auto_release_seconds = 604_800.
+    // Set delivered_at = 2^63 - 604_800 so deadline = 2^63 exactly.
+    // 2^63 as i64 = i64::MIN; i64::MIN.checked_sub(1) overflows.
+    let amounts = vec![&env, 5_000_i128];
+    let (_, freelancer_addr, _, _, _, _, escrow) = setup_funded_escrow(&env, amounts);
+
+    const AUTO_RELEASE: u64 = 604_800;
+    let delivered_at: u64 = (i64::MIN as u64).wrapping_sub(AUTO_RELEASE); // 2^63 - 604_800
+    env.ledger().with_mut(|li| {
+        li.timestamp = delivered_at;
+    });
+    escrow.mark_delivered(&freelancer_addr, &0);
+
+    // current = 1; deadline as i64 = i64::MIN; i64::MIN - 1 overflows.
+    env.ledger().with_mut(|li| {
+        li.timestamp = 1;
+    });
+
+    assert_eq!(
+        escrow.try_time_until_auto_release(&0),
+        Err(Ok(Error::InvalidAmount))
+    );
+}
+
+/// Valid inputs: `try_time_until_auto_release` returns `Ok(expected)`,
+/// identical to the result produced by the non-try variant before the change.
+/// Confirms the checked rewrite is a no-op for all non-overflowing inputs.
+#[test]
+fn time_until_auto_release_valid_inputs_match_plain_arithmetic() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let amounts = vec![&env, 5_000_i128];
+    let (_, freelancer_addr, _, _, _, _, escrow) = setup_funded_escrow(&env, amounts);
+
+    // Ledger starts at 0; delivered_at = 0; auto_release_seconds = 604_800.
+    // deadline = 0 + 604_800 = 604_800; current = 0; result = 604_800.
+    escrow.mark_delivered(&freelancer_addr, &0);
+
+    assert_eq!(escrow.try_time_until_auto_release(&0), Ok(Ok(604_800_i64)));
+
+    // Advance by 100 seconds; result must be 604_700.
+    env.ledger().with_mut(|li| {
+        li.timestamp += 100;
+    });
+    assert_eq!(escrow.try_time_until_auto_release(&0), Ok(Ok(604_700_i64)));
+
+    // Advance past the deadline; result is negative (time already elapsed).
+    env.ledger().with_mut(|li| {
+        li.timestamp += 604_800;
+    });
+    assert_eq!(escrow.try_time_until_auto_release(&0), Ok(Ok(-100_i64)));
+}
+
+// ── #553: typed error when uninitialized ─────────────────────────────────
+
+#[test]
+fn time_extensions_consent_on_uninitialized_returns_not_initialized() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    // No initialize call — Job metadata is absent.
+    assert_eq!(
+        client.try_time_extensions_consent(&1_000, &1, &2),
+        Err(Ok(Error::NotInitialized))
+    );
+
+    // No storage entry must have been mutated; the execution lock must not be set.
+    let lock_held: bool = env.as_contract(&contract_id, || {
+        env.storage()
+            .instance()
+            .get::<_, bool>(&DataKey::TimeExtExecutionLock)
+            .unwrap_or(false)
+    });
+    assert!(!lock_held, "uninitialized call must not set execution lock");
+    let has_job: bool =
+        env.as_contract(&contract_id, || env.storage().instance().has(&DataKey::Job));
+    assert!(!has_job, "uninitialized call must not create Job");
+}
+
+// ── #550: harden auth & precondition guards ────────────────────────────────
+
+#[test]
+fn time_extensions_consent_illegal_source_state_no_mutation_when_locked() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let amounts = vec![&env, 1_000_i128];
+    let (_, _, _, _, _, contract_id, escrow) = setup_funded_escrow(&env, amounts);
+
+    // Simulate an in-progress execution by manually setting the lock.
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .instance()
+            .set(&DataKey::TimeExtExecutionLock, &true);
+    });
+
+    // Must be rejected with the specific illegal-source-state error before any
+    // further ledger access, and must not mutate storage (lock stays set, no
+    // event, no partial write).
+    assert_eq!(
+        escrow.try_time_extensions_consent(&1_000, &1, &2),
+        Err(Ok(Error::TimeExtInProgress))
+    );
+
+    let still_locked: bool = env.as_contract(&contract_id, || {
+        env.storage()
+            .instance()
+            .get::<_, bool>(&DataKey::TimeExtExecutionLock)
+            .unwrap_or(false)
+    });
+    assert!(still_locked, "lock must remain set after rejected call");
+
+    // No event for the rejected call.
+    let topic: Val = symbol_short!("m_extcns").into_val(&env);
+    let count_before = crate::all_event_tuples(&env)
+        .iter()
+        .filter(|e| {
+            e.1.get(0)
+                .map(|t| t.get_payload() == topic.get_payload())
+                .unwrap_or(false)
+        })
+        .count();
+    assert_eq!(count_before, 0, "rejected call must not emit m_extcns");
+
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .instance()
+            .remove(&DataKey::TimeExtExecutionLock);
+    });
+}
+
+#[test]
+fn time_extensions_consent_unauthorized_no_mutation_single_signature() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let amounts = vec![&env, 1_000_i128];
+    let (client_addr, _, _, _, _, contract_id, escrow) = setup_funded_escrow(&env, amounts);
+
+    let invoke = time_ext_consent_invoke!(&env, &contract_id);
+    let result = escrow
+        .mock_auths(&[MockAuth {
+            address: &client_addr,
+            invoke: &invoke,
+        }])
+        .try_time_extensions_consent(&1_000, &1, &2);
+
+    // Missing freelancer signature panics at host level (Err(Err(_))), not a
+    // contract Error, and must not mutate storage.
+    assert!(
+        matches!(result, Err(Err(_))),
+        "single signature must revert at host level"
+    );
+
+    let lock_held: bool = env.as_contract(&contract_id, || {
+        env.storage()
+            .instance()
+            .get::<_, bool>(&DataKey::TimeExtExecutionLock)
+            .unwrap_or(false)
+    });
+    assert!(!lock_held, "unauthorized call must not set execution lock");
+}
+
+#[test]
+fn time_extensions_consent_illegal_source_state_no_mutation_when_paused() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let amounts = vec![&env, 1_000_i128];
+    let (_, _, _, admin_addr, _, contract_id, escrow) = setup_funded_escrow(&env, amounts);
+    escrow.admin_pause_escrow(&admin_addr);
+
+    assert_eq!(
+        escrow.try_time_extensions_consent(&1_000, &1, &2),
+        Err(Ok(Error::Paused))
+    );
+
+    let lock_held: bool = env.as_contract(&contract_id, || {
+        env.storage()
+            .instance()
+            .get::<_, bool>(&DataKey::TimeExtExecutionLock)
+            .unwrap_or(false)
+    });
+    assert!(!lock_held, "paused call must not set execution lock");
+    // Unpause for cleanup.
+    escrow.admin_resume_escrow(&admin_addr);
+}
+
+// ── #551: checked arithmetic ───────────────────────────────────────────────
+
+#[test]
+fn time_extensions_consent_overflow_i128_max_returns_invalid_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let amounts = vec![&env, 1_000_i128];
+    let (_, _, _, _, _, contract_id, escrow) = setup_funded_escrow(&env, amounts);
+
+    // amount * elapsed_seconds overflows i128 inside split_round_nearest.
+    assert_eq!(
+        escrow.try_time_extensions_consent(&i128::MAX, &i128::MAX, &i128::MAX),
+        Err(Ok(Error::InvalidAmount))
+    );
+
+    // No partial write must survive the failure.
+    let lock_held: bool = env.as_contract(&contract_id, || {
+        env.storage()
+            .instance()
+            .get::<_, bool>(&DataKey::TimeExtExecutionLock)
+            .unwrap_or(false)
+    });
+    assert!(!lock_held, "overflow must not leave lock set");
+}
+
+#[test]
+fn time_extensions_consent_overflow_i128_min_returns_invalid_ratio() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let amounts = vec![&env, 1_000_i128];
+    let (_, _, _, _, _, contract_id, escrow) = setup_funded_escrow(&env, amounts);
+
+    // elapsed_seconds = i128::MIN is <0, so InvalidRatio before arithmetic.
+    assert_eq!(
+        escrow.try_time_extensions_consent(&1_000, &i128::MIN, &2),
+        Err(Ok(Error::InvalidRatio))
+    );
+
+    let lock_held: bool = env.as_contract(&contract_id, || {
+        env.storage()
+            .instance()
+            .get::<_, bool>(&DataKey::TimeExtExecutionLock)
+            .unwrap_or(false)
+    });
+    assert!(!lock_held);
+}
+
+#[test]
+fn time_extensions_consent_overflow_no_partial_write_and_lock_cleared() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let amounts = vec![&env, 1_000_i128];
+    let (_, _, _, _, _, contract_id, escrow) = setup_funded_escrow(&env, amounts);
+
+    let result = escrow.try_time_extensions_consent(&i128::MAX, &1, &2);
+    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+    // The test env only records events from the latest invocation, so the
+    // rejected call must have emitted none.
+    assert_eq!(
+        crate::all_event_tuples(&env).len(),
+        0,
+        "overflow must not emit event"
+    );
+    let lock_held: bool = env.as_contract(&contract_id, || {
+        env.storage()
+            .instance()
+            .get::<_, bool>(&DataKey::TimeExtExecutionLock)
+            .unwrap_or(false)
+    });
+    assert!(!lock_held);
 }
