@@ -15,34 +15,64 @@ use soroban_sdk::{
 mod admin_override_refund_tests;
 #[path = "admin_pause_escrow_tests.rs"]
 mod admin_pause_escrow_tests;
+#[path = "admin_resume_escrow_footprint_tests.rs"]
+mod admin_resume_escrow_footprint_tests;
 #[path = "admin_tax_withholding_guards_tests.rs"]
 mod admin_tax_withholding_guards_tests;
 #[path = "arbitration_split_event_tests.rs"]
 mod arbitration_split_event_tests;
+#[path = "emergency_pause_split_refund_tests.rs"]
+mod emergency_pause_split_refund_tests;
 #[path = "execute_admin_transfer_tests.rs"]
 mod execute_admin_transfer_tests;
 #[path = "get_platform_fee_allocation_tests.rs"]
 mod get_platform_fee_allocation_tests;
+#[path = "get_whitelisted_tokens_footprint_tests.rs"]
+mod get_whitelisted_tokens_footprint_tests;
 #[path = "interest_yield_split_refund_guards_tests.rs"]
 mod interest_yield_split_refund_guards_tests;
 #[path = "load_platform_fee_allocation_tests.rs"]
 mod load_platform_fee_allocation_tests;
+#[path = "lock_escrow_interest_yield_event_tests.rs"]
+mod lock_escrow_interest_yield_event_tests;
+#[path = "lock_escrow_interest_yield_guards_tests.rs"]
+mod lock_escrow_interest_yield_guards_tests;
 #[path = "milestone_time_extensions_tests.rs"]
 mod milestone_time_extensions_tests;
 #[path = "multisig_admin_override_refund_tests.rs"]
 mod multisig_admin_override_refund_tests;
+#[path = "multisig_approval_init_event_tests.rs"]
+mod multisig_approval_init_event_tests;
+#[path = "multisig_approval_init_footprint_tests.rs"]
+mod multisig_approval_init_footprint_tests;
+#[path = "multisig_approve_footprint_tests.rs"]
+mod multisig_approve_footprint_tests;
+#[path = "multisig_lock_event_tests.rs"]
+mod multisig_lock_event_tests;
 #[path = "multisig_split_refund_tests.rs"]
 mod multisig_split_refund_tests;
 #[path = "multisig_transfer_admin_tests.rs"]
 mod multisig_transfer_admin_tests;
 #[path = "platform_fee_allocation_no_mutation_tests.rs"]
 mod platform_fee_allocation_no_mutation_tests;
+#[path = "platform_fee_split_overflow_tests.rs"]
+mod platform_fee_split_overflow_tests;
 #[path = "propose_admin_transfer_footprint_tests.rs"]
 mod propose_admin_transfer_footprint_tests;
+#[path = "read_path_tests.rs"]
+mod read_path_tests;
+#[path = "reputation_no_mutation_tests.rs"]
+mod reputation_no_mutation_tests;
+#[path = "revoke_cancel_approval_tests.rs"]
+mod revoke_cancel_approval_tests;
+#[path = "set_escrow_interest_yield_guards_tests.rs"]
+mod set_escrow_interest_yield_guards_tests;
 #[path = "split_refund_net_distribution_tests.rs"]
 mod split_refund_net_distribution_tests;
 #[path = "tax_withholding_tests.rs"]
 mod tax_withholding_tests;
+#[path = "version_tests.rs"]
+mod version_tests;
 
 #[contracttype]
 enum ReentrantTokenDataKey {
@@ -2138,6 +2168,62 @@ fn test_remove_nonexistent_token_fails() {
 }
 
 #[test]
+fn test_remove_whitelisted_token_fails_when_not_initialized() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    let result = client.try_remove_whitelisted_token(&admin, &token);
+    assert_eq!(result, Err(Ok(Error::NotInitialized)));
+}
+
+#[test]
+fn test_remove_whitelisted_token_fails_when_already_funded() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let amounts = vec![&env, 1_000_i128];
+    let (_, _, _, admin_addr, token_addr, _, client) = setup_funded_escrow(&env, amounts);
+
+    let result = client.try_remove_whitelisted_token(&admin_addr, &token_addr);
+    assert_eq!(result, Err(Ok(Error::AlreadyFunded)));
+}
+
+#[test]
+fn test_remove_whitelisted_token_fails_when_invalid_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let admin_addr = Address::generate(&env);
+
+    let token1 = env
+        .register_stellar_asset_contract_v2(admin_addr.clone())
+        .address();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let amounts = vec![&env, 1_000_i128];
+    client.initialize(
+        &admin_addr,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter_addr,
+        &token1,
+        &604800,
+        &amounts,
+    );
+
+    let result = client.try_remove_whitelisted_token(&admin_addr, &token1);
+    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+}
+
+#[test]
 fn test_partial_release_remaining_balance() {
     let env = Env::default();
     env.mock_all_auths();
@@ -3369,7 +3455,7 @@ fn test_multisig_lock_before_initialize_returns_not_initialized() {
 /// Calling multisig_lock twice is idempotent — the flag stays set and no
 /// error is returned on the second call.
 #[test]
-fn test_multisig_lock_idempotent() {
+fn test_multisig_lock_rejects_second_lock() {
     let env = Env::default();
     env.mock_all_auths();
 
@@ -3378,8 +3464,12 @@ fn test_multisig_lock_idempotent() {
     client.multisig_lock(&admin_addr);
     assert!(client.is_multisig_locked());
 
-    // Second call must succeed and leave the flag set.
-    client.multisig_lock(&admin_addr);
+    // Locking an already-locked workflow is an illegal source state (#458):
+    // it is rejected and the flag stays set.
+    assert_eq!(
+        client.try_multisig_lock(&admin_addr),
+        Err(Ok(Error::InvalidStatus))
+    );
     assert!(client.is_multisig_locked());
 }
 
@@ -4117,7 +4207,7 @@ fn test_claim_auto_release_out_of_bounds_index_fails() {
 }
 
 #[test]
-fn test_claim_auto_release_zero_auto_release_seconds_fails() {
+fn test_initialize_zero_auto_release_seconds_fails() {
     let env = Env::default();
     env.mock_all_auths();
 
@@ -5734,6 +5824,39 @@ fn test_initialize_invalid_amount_rolls_back_single_pass_writes() {
 /// return `Error::AlreadyInitialized` and must not mutate any existing state.
 /// This is a focused regression guard on the re-entrancy / double-init path.
 #[test]
+fn test_initialize_event_includes_admin_and_creation_time() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let admin_addr = Address::generate(&env);
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(admin_addr.clone())
+        .address();
+    let contract_id = env.register(MilestoneEscrow, ());
+    let escrow = MilestoneEscrowClient::new(&env, &contract_id);
+    let amounts = vec![&env, 1_000_i128];
+    let created_at = env.ledger().timestamp();
+
+    escrow.initialize(
+        &admin_addr,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter_addr,
+        &token_contract_id,
+        &604_800,
+        &amounts,
+    );
+
+    let events = crate::all_event_tuples(&env);
+    let event = InitializedEvent::from_val(&env, &events.last().unwrap().2);
+    assert_eq!(event.admin, admin_addr);
+    assert_eq!(event.created_at, created_at);
+}
+
+#[test]
 fn test_initialize_already_initialized_returns_correct_error() {
     let env = Env::default();
     env.mock_all_auths();
@@ -7027,6 +7150,117 @@ fn test_add_whitelisted_token_does_not_whitelist_other_tokens() {
     assert_eq!(client.get_whitelisted_tokens().len(), 2);
 }
 
+/// add_whitelisted_token must reject the Stellar zero account address
+/// (`GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF`) with
+/// `Error::InvalidAddress` before touching any job-state storage.
+#[test]
+fn test_add_whitelisted_token_rejects_zero_account_address() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin_addr = Address::generate(&env);
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+
+    let token1 = env
+        .register_stellar_asset_contract_v2(admin_addr.clone())
+        .address();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    client.initialize(
+        &admin_addr,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter_addr,
+        &token1,
+        &604800,
+        &vec![&env, 1_000_i128],
+    );
+
+    let zero_account = Address::from_str(
+        &env,
+        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+    );
+    let result = client.try_add_whitelisted_token(&admin_addr, &zero_account);
+    assert_eq!(result, Err(Ok(Error::InvalidAddress)));
+}
+
+/// add_whitelisted_token must reject the canonical Soroban zero contract
+/// address (`CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4`) with
+/// `Error::InvalidAddress` before touching any job-state storage.
+#[test]
+fn test_add_whitelisted_token_rejects_zero_contract_address() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin_addr = Address::generate(&env);
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+
+    let token1 = env
+        .register_stellar_asset_contract_v2(admin_addr.clone())
+        .address();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    client.initialize(
+        &admin_addr,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter_addr,
+        &token1,
+        &604800,
+        &vec![&env, 1_000_i128],
+    );
+
+    let zero_contract = Address::from_str(
+        &env,
+        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+    );
+    let result = client.try_add_whitelisted_token(&admin_addr, &zero_contract);
+    assert_eq!(result, Err(Ok(Error::InvalidAddress)));
+}
+
+/// add_whitelisted_token must reject the escrow contract's own address with
+/// `Error::InvalidAddress`. Whitelisting the contract itself could be used to
+/// drain funds by routing settlement back to the contract address.
+#[test]
+fn test_add_whitelisted_token_rejects_self_address() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin_addr = Address::generate(&env);
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+
+    let token1 = env
+        .register_stellar_asset_contract_v2(admin_addr.clone())
+        .address();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    client.initialize(
+        &admin_addr,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter_addr,
+        &token1,
+        &604800,
+        &vec![&env, 1_000_i128],
+    );
+
+    // The escrow contract's own address must never be accepted as a token.
+    let result = client.try_add_whitelisted_token(&admin_addr, &contract_id);
+    assert_eq!(result, Err(Ok(Error::InvalidAddress)));
+}
+
 /// Verify raise_dispute by client succeeds (client is an authorized party).
 #[test]
 fn test_raise_dispute_by_client_succeeds() {
@@ -7121,15 +7355,21 @@ fn test_dispute_flag_only_sets_targeted_milestone() {
 // TASK: emergency_pause_split_refund distribution pathways
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/// A funded escrow frozen by `emergency_pause_admin_override`, plus its admin.
+fn emergency_paused_escrow(env: &Env) -> (Address, MilestoneEscrowClient<'_>) {
+    env.mock_all_auths();
+    let (_, _, _, admin, _, _, client) = setup_funded_escrow(env, vec![env, 1_000_i128]);
+    client.emergency_pause_admin_override(&admin, &true);
+    (admin, client)
+}
+
 #[test]
 fn test_emergency_pause_split_refund_even_split() {
     let env = Env::default();
-    env.mock_all_auths();
+    let (admin, client) = emergency_paused_escrow(&env);
 
-    let contract_id = env.register(MilestoneEscrow, ());
-    let client = MilestoneEscrowClient::new(&env, &contract_id);
-
-    let allocation = client.emergency_pause_split_refund(&1_000_i128, &5_000_u32, &5_000_u32);
+    let allocation =
+        client.emergency_pause_split_refund(&admin, &1_000_i128, &5_000_u32, &5_000_u32);
     assert_eq!(allocation.client_refund, 500);
     assert_eq!(allocation.freelancer_payout, 500);
     assert_eq!(allocation.client_refund_bps, 5_000);
@@ -7143,13 +7383,10 @@ fn test_emergency_pause_split_refund_even_split() {
 #[test]
 fn test_emergency_pause_split_refund_odd_amount_rounding() {
     let env = Env::default();
-    env.mock_all_auths();
-
-    let contract_id = env.register(MilestoneEscrow, ());
-    let client = MilestoneEscrowClient::new(&env, &contract_id);
+    let (admin, client) = emergency_paused_escrow(&env);
 
     // 101 split 50/50: client gets 51, freelancer gets 50
-    let allocation = client.emergency_pause_split_refund(&101_i128, &5_000_u32, &5_000_u32);
+    let allocation = client.emergency_pause_split_refund(&admin, &101_i128, &5_000_u32, &5_000_u32);
     assert_eq!(allocation.client_refund, 51);
     assert_eq!(allocation.freelancer_payout, 50);
     assert_eq!(allocation.client_refund + allocation.freelancer_payout, 101);
@@ -7158,13 +7395,11 @@ fn test_emergency_pause_split_refund_odd_amount_rounding() {
 #[test]
 fn test_emergency_pause_split_refund_invalid_ratio_fails() {
     let env = Env::default();
-    env.mock_all_auths();
-
-    let contract_id = env.register(MilestoneEscrow, ());
-    let client = MilestoneEscrowClient::new(&env, &contract_id);
+    let (admin, client) = emergency_paused_escrow(&env);
 
     // 5000 + 3000 = 8000 != 10000
-    let result = client.try_emergency_pause_split_refund(&1_000_i128, &5_000_u32, &3_000_u32);
+    let result =
+        client.try_emergency_pause_split_refund(&admin, &1_000_i128, &5_000_u32, &3_000_u32);
     assert_eq!(result, Err(Ok(Error::InvalidRatio)));
 }
 
@@ -7892,6 +8127,15 @@ fn test_multisig_split_refund_emits_event() {
 
     let contract_id = env.register(MilestoneEscrow, ());
     let client = MilestoneEscrowClient::new(&env, &contract_id);
+    client.initialize(
+        &admin_addr,
+        &client_addr,
+        &_freelancer_addr,
+        &_arbiter_addr,
+        &token_contract_id,
+        &604800,
+        &vec![&env, 1000_i128],
+    );
 
     // Negative numerator
     assert_eq!(
@@ -7958,6 +8202,15 @@ fn test_payment_streaming_milestones_negative_amount_fails() {
 
     let contract_id = env.register(MilestoneEscrow, ());
     let client = MilestoneEscrowClient::new(&env, &contract_id);
+    client.initialize(
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &604800,
+        &vec![&env, 1000_i128],
+    );
 
     assert_eq!(
         client.try_payment_streaming_milestones(&-1_i128, &1_i128, &2_i128),
@@ -7972,6 +8225,15 @@ fn test_payment_streaming_milestones_zero_denominator_fails() {
 
     let contract_id = env.register(MilestoneEscrow, ());
     let client = MilestoneEscrowClient::new(&env, &contract_id);
+    client.initialize(
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &604800,
+        &vec![&env, 1000_i128],
+    );
 
     assert_eq!(
         client.try_payment_streaming_milestones(&100_i128, &1_i128, &0_i128),
@@ -7993,6 +8255,15 @@ fn test_payment_streaming_milestones_zero_amount_fails() {
 
     let contract_id = env.register(MilestoneEscrow, ());
     let client = MilestoneEscrowClient::new(&env, &contract_id);
+    client.initialize(
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &604800,
+        &vec![&env, 1000_i128],
+    );
 
     assert_eq!(
         client.try_payment_streaming_milestones(&0_i128, &1_i128, &2_i128),
@@ -8007,6 +8278,15 @@ fn test_payment_streaming_milestones_full_amount() {
 
     let contract_id = env.register(MilestoneEscrow, ());
     let client = MilestoneEscrowClient::new(&env, &contract_id);
+    client.initialize(
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &604800,
+        &vec![&env, 1000_i128],
+    );
 
     let split = client.payment_streaming_milestones(&1000_i128, &100_i128, &100_i128);
     assert_eq!(split.first, 1000);
@@ -8020,6 +8300,15 @@ fn test_payment_streaming_milestones_zero_numerator() {
 
     let contract_id = env.register(MilestoneEscrow, ());
     let client = MilestoneEscrowClient::new(&env, &contract_id);
+    client.initialize(
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &604800,
+        &vec![&env, 1000_i128],
+    );
 
     let split = client.payment_streaming_milestones(&1000_i128, &0_i128, &100_i128);
     assert_eq!(split.first, 0);
@@ -8033,6 +8322,15 @@ fn test_payment_streaming_milestones_overflow_fails() {
 
     let contract_id = env.register(MilestoneEscrow, ());
     let client = MilestoneEscrowClient::new(&env, &contract_id);
+    client.initialize(
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &604800,
+        &vec![&env, 1000_i128],
+    );
 
     assert_eq!(
         client.try_payment_streaming_milestones(&i128::MAX, &i128::MAX, &i128::MAX),
@@ -8047,6 +8345,15 @@ fn test_payment_streaming_milestones_emits_event() {
 
     let contract_id = env.register(MilestoneEscrow, ());
     let client = MilestoneEscrowClient::new(&env, &contract_id);
+    client.initialize(
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &604800,
+        &vec![&env, 1000_i128],
+    );
 
     let amount = 1_000_i128;
     let num = 300_i128;
@@ -9343,6 +9650,20 @@ fn test_milestone_time_extensions_half_rounds_nearest() {
 
     let contract_id = env.register(MilestoneEscrow, ());
     let client = MilestoneEscrowClient::new(&env, &contract_id);
+    let admin_addr = Address::generate(&env);
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let token_addr = Address::generate(&env);
+    client.initialize(
+        &admin_addr,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter_addr,
+        &token_addr,
+        &604800,
+        &vec![&env, 1000_i128],
+    );
 
     let split = client.milestone_time_extensions(&101_i128, &1_i128, &2_i128);
     assert_eq!(split.first, 51);
@@ -9360,6 +9681,20 @@ fn test_milestone_time_extensions_full_elapsed_gives_full_amount() {
 
     let contract_id = env.register(MilestoneEscrow, ());
     let client = MilestoneEscrowClient::new(&env, &contract_id);
+    let admin_addr = Address::generate(&env);
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let token_addr = Address::generate(&env);
+    client.initialize(
+        &admin_addr,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter_addr,
+        &token_addr,
+        &604800,
+        &vec![&env, 1000_i128],
+    );
 
     let split = client.milestone_time_extensions(&10_000_i128, &500_i128, &500_i128);
     assert_eq!(split.first, 10_000);
@@ -9377,6 +9712,20 @@ fn test_milestone_time_extensions_zero_elapsed_gives_nothing_to_freelancer() {
 
     let contract_id = env.register(MilestoneEscrow, ());
     let client = MilestoneEscrowClient::new(&env, &contract_id);
+    let admin_addr = Address::generate(&env);
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let token_addr = Address::generate(&env);
+    client.initialize(
+        &admin_addr,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter_addr,
+        &token_addr,
+        &604800,
+        &vec![&env, 1000_i128],
+    );
 
     let split = client.milestone_time_extensions(&10_000_i128, &0_i128, &500_i128);
     assert_eq!(split.first, 0);
@@ -9394,6 +9743,20 @@ fn test_milestone_time_extensions_zero_amount_fails() {
 
     let contract_id = env.register(MilestoneEscrow, ());
     let client = MilestoneEscrowClient::new(&env, &contract_id);
+    let admin_addr = Address::generate(&env);
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let token_addr = Address::generate(&env);
+    client.initialize(
+        &admin_addr,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter_addr,
+        &token_addr,
+        &604800,
+        &vec![&env, 1000_i128],
+    );
 
     let result = client.try_milestone_time_extensions(&0_i128, &1_i128, &3_i128);
     assert_eq!(result, Err(Ok(Error::InvalidAmount)));
@@ -9410,6 +9773,20 @@ fn test_milestone_time_extensions_large_prime_total_preserved() {
 
     let contract_id = env.register(MilestoneEscrow, ());
     let client = MilestoneEscrowClient::new(&env, &contract_id);
+    let admin_addr = Address::generate(&env);
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let token_addr = Address::generate(&env);
+    client.initialize(
+        &admin_addr,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter_addr,
+        &token_addr,
+        &604800,
+        &vec![&env, 1000_i128],
+    );
 
     let amount = 999_983_i128;
     let split = client.milestone_time_extensions(&amount, &3_i128, &7_i128);
@@ -9433,6 +9810,20 @@ fn test_milestone_time_extensions_one_stroop_rounds_down() {
 
     let contract_id = env.register(MilestoneEscrow, ());
     let client = MilestoneEscrowClient::new(&env, &contract_id);
+    let admin_addr = Address::generate(&env);
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let token_addr = Address::generate(&env);
+    client.initialize(
+        &admin_addr,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter_addr,
+        &token_addr,
+        &604800,
+        &vec![&env, 1000_i128],
+    );
 
     let split = client.milestone_time_extensions(&1_i128, &1_i128, &3_i128);
     assert_eq!(split.first + split.second, 1);
@@ -9452,6 +9843,20 @@ fn test_milestone_time_extensions_sequential_splits_cover_total() {
 
     let contract_id = env.register(MilestoneEscrow, ());
     let client = MilestoneEscrowClient::new(&env, &contract_id);
+    let admin_addr = Address::generate(&env);
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let token_addr = Address::generate(&env);
+    client.initialize(
+        &admin_addr,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter_addr,
+        &token_addr,
+        &604800,
+        &vec![&env, 1000_i128],
+    );
 
     let amount = 1_000_000_i128;
     let parts: u32 = 7;
@@ -9485,6 +9890,20 @@ fn test_milestone_time_extensions_negative_amount_fails() {
 
     let contract_id = env.register(MilestoneEscrow, ());
     let client = MilestoneEscrowClient::new(&env, &contract_id);
+    let admin_addr = Address::generate(&env);
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let token_addr = Address::generate(&env);
+    client.initialize(
+        &admin_addr,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter_addr,
+        &token_addr,
+        &604800,
+        &vec![&env, 1000_i128],
+    );
 
     let result = client.try_milestone_time_extensions(&-1_i128, &1_i128, &10_i128);
     assert_eq!(result, Err(Ok(Error::InvalidAmount)));
@@ -9499,6 +9918,20 @@ fn test_milestone_time_extensions_zero_total_seconds_fails() {
 
     let contract_id = env.register(MilestoneEscrow, ());
     let client = MilestoneEscrowClient::new(&env, &contract_id);
+    let admin_addr = Address::generate(&env);
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let token_addr = Address::generate(&env);
+    client.initialize(
+        &admin_addr,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter_addr,
+        &token_addr,
+        &604800,
+        &vec![&env, 1000_i128],
+    );
 
     let result = client.try_milestone_time_extensions(&1_000_i128, &0_i128, &0_i128);
     assert_eq!(result, Err(Ok(Error::InvalidRatio)));
@@ -9513,6 +9946,20 @@ fn test_milestone_time_extensions_elapsed_exceeds_total_fails() {
 
     let contract_id = env.register(MilestoneEscrow, ());
     let client = MilestoneEscrowClient::new(&env, &contract_id);
+    let admin_addr = Address::generate(&env);
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let token_addr = Address::generate(&env);
+    client.initialize(
+        &admin_addr,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter_addr,
+        &token_addr,
+        &604800,
+        &vec![&env, 1000_i128],
+    );
 
     let result = client.try_milestone_time_extensions(&1_000_i128, &11_i128, &10_i128);
     assert_eq!(result, Err(Ok(Error::InvalidRatio)));
@@ -9527,6 +9974,20 @@ fn test_milestone_time_extensions_negative_elapsed_fails() {
 
     let contract_id = env.register(MilestoneEscrow, ());
     let client = MilestoneEscrowClient::new(&env, &contract_id);
+    let admin_addr = Address::generate(&env);
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let token_addr = Address::generate(&env);
+    client.initialize(
+        &admin_addr,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter_addr,
+        &token_addr,
+        &604800,
+        &vec![&env, 1000_i128],
+    );
 
     let result = client.try_milestone_time_extensions(&1_000_i128, &-1_i128, &10_i128);
     assert_eq!(result, Err(Ok(Error::InvalidRatio)));
@@ -9541,6 +10002,20 @@ fn test_milestone_time_extensions_negative_total_seconds_fails() {
 
     let contract_id = env.register(MilestoneEscrow, ());
     let client = MilestoneEscrowClient::new(&env, &contract_id);
+    let admin_addr = Address::generate(&env);
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let token_addr = Address::generate(&env);
+    client.initialize(
+        &admin_addr,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter_addr,
+        &token_addr,
+        &604800,
+        &vec![&env, 1000_i128],
+    );
 
     let result = client.try_milestone_time_extensions(&1_000_i128, &5_i128, &-10_i128);
     assert_eq!(result, Err(Ok(Error::InvalidRatio)));
@@ -9555,6 +10030,20 @@ fn test_milestone_time_extensions_overflow_fails() {
 
     let contract_id = env.register(MilestoneEscrow, ());
     let client = MilestoneEscrowClient::new(&env, &contract_id);
+    let admin_addr = Address::generate(&env);
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let token_addr = Address::generate(&env);
+    client.initialize(
+        &admin_addr,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter_addr,
+        &token_addr,
+        &604800,
+        &vec![&env, 1000_i128],
+    );
 
     let result = client.try_milestone_time_extensions(&i128::MAX, &i128::MAX, &i128::MAX);
     assert_eq!(result, Err(Ok(Error::InvalidAmount)));
@@ -10480,6 +10969,20 @@ fn test_milestone_time_extensions_emits_event() {
 
     let contract_id = env.register(MilestoneEscrow, ());
     let client = MilestoneEscrowClient::new(&env, &contract_id);
+    let admin_addr = Address::generate(&env);
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let token_addr = Address::generate(&env);
+    client.initialize(
+        &admin_addr,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter_addr,
+        &token_addr,
+        &604800,
+        &vec![&env, 1000_i128],
+    );
 
     let amount = 1_000_i128;
     let elapsed = 300_i128;
@@ -10517,6 +11020,20 @@ fn test_milestone_time_extensions_zero_elapsed_emits_event() {
 
     let contract_id = env.register(MilestoneEscrow, ());
     let client = MilestoneEscrowClient::new(&env, &contract_id);
+    let admin_addr = Address::generate(&env);
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let token_addr = Address::generate(&env);
+    client.initialize(
+        &admin_addr,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter_addr,
+        &token_addr,
+        &604800,
+        &vec![&env, 1000_i128],
+    );
 
     let amount = 1_000_i128;
     let elapsed = 0_i128;
@@ -10554,6 +11071,20 @@ fn test_milestone_time_extensions_full_elapsed_emits_event() {
 
     let contract_id = env.register(MilestoneEscrow, ());
     let client = MilestoneEscrowClient::new(&env, &contract_id);
+    let admin_addr = Address::generate(&env);
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let token_addr = Address::generate(&env);
+    client.initialize(
+        &admin_addr,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter_addr,
+        &token_addr,
+        &604800,
+        &vec![&env, 1000_i128],
+    );
 
     let amount = 1_000_i128;
     let elapsed = 600_i128;
@@ -11154,6 +11685,15 @@ fn test_payment_streaming_milestones_zero_total_fails() {
 
     let contract_id = env.register(MilestoneEscrow, ());
     let client = MilestoneEscrowClient::new(&env, &contract_id);
+    client.initialize(
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &604800,
+        &vec![&env, 1000_i128],
+    );
 
     let result = client.try_payment_streaming_milestones(&0_i128, &1_i128, &2_i128);
     assert_eq!(result, Err(Ok(Error::InvalidAmount)));
@@ -11167,6 +11707,15 @@ fn test_payment_streaming_milestones_negative_total_fails() {
 
     let contract_id = env.register(MilestoneEscrow, ());
     let client = MilestoneEscrowClient::new(&env, &contract_id);
+    client.initialize(
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &604800,
+        &vec![&env, 1000_i128],
+    );
 
     let result = client.try_payment_streaming_milestones(&-500_i128, &1_i128, &2_i128);
     assert_eq!(result, Err(Ok(Error::InvalidAmount)));
@@ -11180,6 +11729,15 @@ fn test_payment_streaming_milestones_positive_total_succeeds() {
 
     let contract_id = env.register(MilestoneEscrow, ());
     let client = MilestoneEscrowClient::new(&env, &contract_id);
+    client.initialize(
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &604800,
+        &vec![&env, 1000_i128],
+    );
 
     // 1000 streamed at 1/4 elapsed: first=250, second=750, sum=1000
     let split = client.payment_streaming_milestones(&1_000_i128, &1_i128, &4_i128);
@@ -11201,6 +11759,20 @@ fn test_milestone_time_extensions_zero_balance_is_blocked() {
 
     let contract_id = env.register(MilestoneEscrow, ());
     let client = MilestoneEscrowClient::new(&env, &contract_id);
+    let admin_addr = Address::generate(&env);
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let token_addr = Address::generate(&env);
+    client.initialize(
+        &admin_addr,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter_addr,
+        &token_addr,
+        &604800,
+        &vec![&env, 1000_i128],
+    );
 
     let result = client.try_milestone_time_extensions(&0_i128, &3_i128, &10_i128);
     assert_eq!(result, Err(Ok(Error::InvalidAmount)));
@@ -11214,6 +11786,20 @@ fn test_milestone_time_extensions_negative_balance_is_blocked() {
 
     let contract_id = env.register(MilestoneEscrow, ());
     let client = MilestoneEscrowClient::new(&env, &contract_id);
+    let admin_addr = Address::generate(&env);
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let token_addr = Address::generate(&env);
+    client.initialize(
+        &admin_addr,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter_addr,
+        &token_addr,
+        &604800,
+        &vec![&env, 1000_i128],
+    );
 
     let result = client.try_milestone_time_extensions(&-1_000_i128, &3_i128, &10_i128);
     assert_eq!(result, Err(Ok(Error::InvalidAmount)));
@@ -11227,6 +11813,20 @@ fn test_milestone_time_extensions_positive_balance_succeeds_and_emits_event() {
 
     let contract_id = env.register(MilestoneEscrow, ());
     let client = MilestoneEscrowClient::new(&env, &contract_id);
+    let admin_addr = Address::generate(&env);
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let token_addr = Address::generate(&env);
+    client.initialize(
+        &admin_addr,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter_addr,
+        &token_addr,
+        &604800,
+        &vec![&env, 1000_i128],
+    );
 
     // 600 split at 1/3 elapsed: round_nearest(600 * 1 / 3) = 200
     let split = client.milestone_time_extensions(&600_i128, &1_i128, &3_i128);
@@ -14291,4 +14891,282 @@ fn test_initialize_overflow_in_middle_of_list_returns_typed_error() {
             "no milestone must be persisted after a failed initialize"
         );
     });
+}
+
+// ============================================================================
+// raise_dispute — hardened authorization and precondition guard tests (#566)
+//
+// These tests verify that:
+//   1. An unauthorized caller (neither client nor freelancer) is rejected
+//      with Error::Unauthorized and no storage is mutated.
+//   2. A caller with an illegal milestone source state (Released) is rejected
+//      with Error::InvalidStatus and no storage is mutated.
+//   3. Both the client and the freelancer can legitimately raise a dispute
+//      (regression guard).
+// ============================================================================
+
+/// Guard 1 — UNAUTHORIZED CALLER:
+/// An address that is neither the client nor the freelancer must receive
+/// `Error::Unauthorized`.  The milestone must remain in its original
+/// `Pending` state, confirming no storage mutation occurred (in particular,
+/// the DisputeLock must not have been set and left behind).
+#[test]
+fn test_raise_dispute_unauthorized_caller_returns_error_and_no_storage_mutated() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let admin_addr = Address::generate(&env);
+    let bad_actor = Address::generate(&env);
+
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(admin_addr.clone())
+        .address();
+    let token_admin = token::StellarAssetClient::new(&env, &token_contract_id);
+    token_admin.mint(&client_addr, &2_000);
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let amounts = vec![&env, 2_000_i128];
+    client.initialize(
+        &admin_addr,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter_addr,
+        &token_contract_id,
+        &604800,
+        &amounts,
+    );
+    client.fund(&client_addr);
+
+    // `bad_actor` is neither the client nor the freelancer.
+    let result = client.try_raise_dispute(&bad_actor, &0u32);
+    assert_eq!(
+        result,
+        Err(Ok(Error::Unauthorized)),
+        "expected Unauthorized for a caller that is not the client or freelancer"
+    );
+
+    // No storage should have been mutated: the milestone must still be Pending.
+    let job = client.get_job();
+    assert_eq!(
+        job.milestones.get(0).unwrap().status,
+        MilestoneStatus::Pending,
+        "milestone status must not change when raise_dispute is called by an unauthorized party"
+    );
+}
+
+/// Guard 2 — ILLEGAL SOURCE STATE (Released milestone):
+/// Attempting to dispute a milestone that has already been `Released` must
+/// return `Error::InvalidStatus`.  The milestone status must remain
+/// `Released` after the rejected call, confirming no storage mutation.
+#[test]
+fn test_raise_dispute_illegal_source_state_returns_error_and_no_storage_mutated() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let admin_addr = Address::generate(&env);
+
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(admin_addr.clone())
+        .address();
+    let token_admin = token::StellarAssetClient::new(&env, &token_contract_id);
+    token_admin.mint(&client_addr, &2_000);
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let amounts = vec![&env, 2_000_i128];
+    client.initialize(
+        &admin_addr,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter_addr,
+        &token_contract_id,
+        &604800,
+        &amounts,
+    );
+    client.fund(&client_addr);
+
+    // Advance the milestone to Released via the normal happy path.
+    client.mark_delivered(&freelancer_addr, &0u32);
+    client.approve_milestone(&client_addr, &0u32);
+
+    // Confirm the milestone is Released before we attempt the dispute.
+    let job_before = client.get_job();
+    assert_eq!(
+        job_before.milestones.get(0).unwrap().status,
+        MilestoneStatus::Released,
+        "precondition: milestone should be Released before attempting raise_dispute"
+    );
+
+    // Disputing a Released milestone must be rejected.
+    let result = client.try_raise_dispute(&client_addr, &0u32);
+    assert_eq!(
+        result,
+        Err(Ok(Error::InvalidStatus)),
+        "expected InvalidStatus when raise_dispute is called on a Released milestone"
+    );
+
+    // The milestone must still be Released — no mutation occurred.
+    let job_after = client.get_job();
+    assert_eq!(
+        job_after.milestones.get(0).unwrap().status,
+        MilestoneStatus::Released,
+        "milestone status must not change when raise_dispute is rejected due to invalid state"
+    );
+}
+
+/// Guard 3 — ILLEGAL SOURCE STATE (Refunded milestone):
+/// Attempting to dispute a milestone that has been `Refunded` must return
+/// `Error::InvalidStatus`.  The milestone status must remain `Refunded`.
+#[test]
+fn test_raise_dispute_refunded_state_returns_invalid_status_and_no_storage_mutated() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let admin_addr = Address::generate(&env);
+
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(admin_addr.clone())
+        .address();
+    let token_admin = token::StellarAssetClient::new(&env, &token_contract_id);
+    token_admin.mint(&client_addr, &2_000);
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let amounts = vec![&env, 2_000_i128];
+    client.initialize(
+        &admin_addr,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter_addr,
+        &token_contract_id,
+        &604800,
+        &amounts,
+    );
+    client.fund(&client_addr);
+
+    // First raise a dispute legitimately, then resolve it as a refund.
+    client.raise_dispute(&client_addr, &0u32);
+    client.resolve_dispute(&arbiter_addr, &0u32, &false);
+
+    // Confirm the milestone is Refunded.
+    let job_before = client.get_job();
+    assert_eq!(
+        job_before.milestones.get(0).unwrap().status,
+        MilestoneStatus::Refunded,
+        "precondition: milestone should be Refunded"
+    );
+
+    // Attempting to re-dispute a Refunded milestone must be rejected.
+    let result = client.try_raise_dispute(&client_addr, &0u32);
+    assert_eq!(
+        result,
+        Err(Ok(Error::InvalidStatus)),
+        "expected InvalidStatus when raise_dispute is called on a Refunded milestone"
+    );
+
+    // The milestone must still be Refunded — no mutation occurred.
+    let job_after = client.get_job();
+    assert_eq!(
+        job_after.milestones.get(0).unwrap().status,
+        MilestoneStatus::Refunded,
+        "milestone status must not change when raise_dispute is rejected on a Refunded milestone"
+    );
+}
+
+/// Regression guard — CLIENT can raise a dispute on a Pending milestone.
+#[test]
+fn test_raise_dispute_by_client_on_pending_milestone_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let admin_addr = Address::generate(&env);
+
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(admin_addr.clone())
+        .address();
+    let token_admin = token::StellarAssetClient::new(&env, &token_contract_id);
+    token_admin.mint(&client_addr, &2_000);
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let amounts = vec![&env, 2_000_i128];
+    client.initialize(
+        &admin_addr,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter_addr,
+        &token_contract_id,
+        &604800,
+        &amounts,
+    );
+    client.fund(&client_addr);
+
+    client.raise_dispute(&client_addr, &0u32);
+
+    let job = client.get_job();
+    assert_eq!(
+        job.milestones.get(0).unwrap().status,
+        MilestoneStatus::Disputed,
+        "client should be able to raise a dispute on a Pending milestone"
+    );
+}
+
+/// Regression guard — FREELANCER can raise a dispute on a Delivered milestone.
+#[test]
+fn test_raise_dispute_by_freelancer_on_delivered_milestone_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let admin_addr = Address::generate(&env);
+
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(admin_addr.clone())
+        .address();
+    let token_admin = token::StellarAssetClient::new(&env, &token_contract_id);
+    token_admin.mint(&client_addr, &2_000);
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let amounts = vec![&env, 2_000_i128];
+    client.initialize(
+        &admin_addr,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter_addr,
+        &token_contract_id,
+        &604800,
+        &amounts,
+    );
+    client.fund(&client_addr);
+    client.mark_delivered(&freelancer_addr, &0u32);
+
+    client.raise_dispute(&freelancer_addr, &0u32);
+
+    let job = client.get_job();
+    assert_eq!(
+        job.milestones.get(0).unwrap().status,
+        MilestoneStatus::Disputed,
+        "freelancer should be able to raise a dispute on a Delivered milestone"
+    );
 }
